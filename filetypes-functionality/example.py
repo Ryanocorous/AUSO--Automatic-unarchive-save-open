@@ -1,9 +1,9 @@
 from pathlib import Path
 
-# Rename this file and list the extensions it handles.
 HANDLER = {"name": "myformat", "extensions": [".myformat"], "priority": 50}
 
 
-def extract(source: Path, destination: Path) -> None:
-    # Extract source into destination.
+def extract(source: Path, destination: Path, progress=None) -> None:
+    if progress:
+        progress(0, source.stat().st_size)
     raise NotImplementedError

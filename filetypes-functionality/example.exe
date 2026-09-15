@@ -2,4 +2,7 @@ Rename this file to your tool name.
 Support --autoextract-describe and print:
 {"name":"myformat","extensions":[".myformat"],"priority":50}
 Support --autoextract-extract SOURCE DESTINATION.
+For progress, print AUSO_PROGRESS 42 for percent,
+or AUSO_PROGRESS 123456 456789 for done/total bytes.
+If the EXE cannot do that, add tool.progress.py beside tool.exe.
 Exit 0 for success.
