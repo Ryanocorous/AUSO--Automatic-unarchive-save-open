@@ -1,0 +1,5 @@
+Rename this file to your tool name.
+Support --autoextract-describe and print:
+{"name":"myformat","extensions":[".myformat"],"priority":50}
+Support --autoextract-extract SOURCE DESTINATION.
+Exit 0 for success.

@@ -1,27 +1,32 @@
 from __future__ import annotations
 
 import argparse
-import bz2
 import configparser
 import ctypes
 from ctypes import wintypes
-import gzip
+from contextlib import contextmanager
+from dataclasses import dataclass
+import importlib.util
+import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import shutil
-import stat
 import subprocess
 import sys
-import tarfile
 import time
-import zipfile
+from typing import Callable
 
-APP_NAME = "Auto_Unzip-Save-Open-Lightweight"
+APP_NAME = "Auto_Unzip-Save-Open"
+SERVICE_NAME = APP_NAME
 TEMP_SUFFIXES = (".crdownload", ".part", ".partial", ".download", ".tmp")
-ARCHIVE_SUFFIXES = (
-    ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz",
-    ".zip", ".tar", ".gz", ".bz2", ".xz",
-)
+
+
+@dataclass
+class Handler:
+    name: str
+    extensions: tuple[str, ...]
+    priority: int
+    extract: Callable[[Path, Path], None]
 
 
 def base_dir() -> Path:
@@ -36,17 +41,114 @@ def load_config() -> configparser.ConfigParser:
     return config
 
 
-def expand_path(text: str) -> Path:
-    return Path(os.path.expandvars(os.path.expanduser(text.strip().strip('"')))).resolve()
+def downloads_default() -> Path:
+    return Path.home() / "Downloads"
 
 
-def paths(config: configparser.ConfigParser) -> tuple[Path, Path]:
+def configured_paths(config: configparser.ConfigParser) -> tuple[Path, Path]:
     settings = config["settings"]
-    downloads_text = settings.get("downloads_folder", "").strip()
-    downloads = expand_path(downloads_text) if downloads_text else (Path.home() / "Downloads").resolve()
-    dump_text = settings.get("dump_folder", "").strip()
-    dump = expand_path(dump_text) if dump_text else (downloads / "Dump").resolve()
+    text = settings.get("downloads_folder", "").strip()
+    downloads = Path(os.path.expandvars(os.path.expanduser(text))).resolve() if text else downloads_default().resolve()
+    text = settings.get("dump_folder", "").strip()
+    dump = Path(os.path.expandvars(os.path.expanduser(text))).resolve() if text else (downloads / "Dump").resolve()
     return downloads, dump
+
+
+def run_hidden(command: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    options = {
+        "cwd": str(cwd) if cwd else None,
+        "text": True,
+        "capture_output": True,
+        "check": False,
+    }
+    if os.name == "nt":
+        options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.run(command, **options)
+
+
+def run_exe_extract(path: Path, source: Path, destination: Path) -> None:
+    result = run_hidden([str(path), "--autoextract-extract", str(source), str(destination)], path.parent)
+    if result.returncode:
+        raise RuntimeError((result.stderr or result.stdout or "Handler failed").strip())
+
+
+def exe_handler(path: Path) -> Handler | None:
+    name = path.name.lower()
+    if name in {"7z.exe", "7za.exe", "7zr.exe"}:
+        def extract(source: Path, destination: Path) -> None:
+            result = run_hidden([str(path), "x", "-y", f"-o{destination}", str(source)], path.parent)
+            if result.returncode:
+                raise RuntimeError((result.stderr or result.stdout or "7-Zip failed").strip())
+        return Handler("sevenzip-cli", (".7z", ".rar", ".z"), 80, extract)
+
+    if name in {"unrar.exe", "rar.exe"}:
+        def extract(source: Path, destination: Path) -> None:
+            result = run_hidden([str(path), "x", "-o+", str(source), str(destination) + os.sep], path.parent)
+            if result.returncode:
+                raise RuntimeError((result.stderr or result.stdout or "UnRAR failed").strip())
+        return Handler("unrar-cli", (".rar",), 85, extract)
+
+    result = run_hidden([str(path), "--autoextract-describe"], path.parent)
+    if result.returncode:
+        return None
+    try:
+        meta = json.loads(result.stdout)
+        extensions = tuple(sorted({str(item).lower() for item in meta["extensions"]}, key=len, reverse=True))
+        name = str(meta["name"]).strip().lower()
+        priority = int(meta.get("priority", 50))
+        return Handler(name, extensions, priority, lambda source, destination: run_exe_extract(path, source, destination))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def load_handlers(config: configparser.ConfigParser) -> list[Handler]:
+    folder = base_dir() / "filetypes-functionality"
+    folder.mkdir(parents=True, exist_ok=True)
+    handlers: list[Handler] = []
+
+    for path in sorted(folder.glob("*.py")):
+        if path.stem.lower().startswith("example"):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(f"auso_{path.stem}", path)
+            if not spec or not spec.loader:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            meta = module.HANDLER
+            name = str(meta["name"]).strip().lower()
+            if not config.getboolean("handlers", name, fallback=True):
+                continue
+            extensions = tuple(sorted({str(item).lower() for item in meta["extensions"]}, key=len, reverse=True))
+            handlers.append(Handler(name, extensions, int(meta.get("priority", 50)), module.extract))
+        except Exception:
+            log(f"Could not load {path.name}")
+
+    for path in sorted(folder.glob("*.exe")):
+        if path.stem.lower().startswith("example"):
+            continue
+        try:
+            handler = exe_handler(path)
+            if handler and config.getboolean("handlers", handler.name, fallback=True):
+                handlers.append(handler)
+        except Exception:
+            log(f"Could not load {path.name}")
+
+    handlers.sort(key=lambda item: item.priority, reverse=True)
+    return handlers
+
+
+def choose_handler(path: Path, handlers: list[Handler]) -> tuple[Handler, str] | None:
+    name = path.name.lower()
+    matches: list[tuple[int, int, Handler, str]] = []
+    for handler in handlers:
+        for extension in handler.extensions:
+            if name.endswith(extension):
+                matches.append((len(extension), handler.priority, handler, extension))
+    if not matches:
+        return None
+    _, _, handler, extension = max(matches, key=lambda item: (item[0], item[1]))
+    return handler, extension
 
 
 def excluded(path: Path, text: str) -> bool:
@@ -62,55 +164,13 @@ def excluded(path: Path, text: str) -> bool:
     return False
 
 
-def archive_suffix(path: Path) -> str | None:
-    name = path.name.lower()
-    for suffix in ARCHIVE_SUFFIXES:
-        if name.endswith(suffix):
-            return suffix
-    return None
+def signature(path: Path) -> tuple[int, int]:
+    stat = path.stat()
+    return stat.st_size, stat.st_mtime_ns
 
 
-def safe_name(name: str) -> bool:
-    name = name.replace("\\", "/")
-    p = PurePosixPath(name)
-    return not p.is_absolute() and ".." not in p.parts and not (p.parts and ":" in p.parts[0])
-
-
-def extract_zip(source: Path, destination: Path) -> None:
-    with zipfile.ZipFile(source) as archive:
-        for info in archive.infolist():
-            if not safe_name(info.filename):
-                raise ValueError("Unsafe ZIP path")
-            mode = info.external_attr >> 16
-            if stat.S_ISLNK(mode):
-                raise ValueError("ZIP links are not supported")
-        archive.extractall(destination)
-
-
-def extract_tar(source: Path, destination: Path) -> None:
-    with tarfile.open(source, "r:*") as archive:
-        members = archive.getmembers()
-        for member in members:
-            if not safe_name(member.name):
-                raise ValueError("Unsafe TAR path")
-            if member.issym() or member.islnk() or member.isdev():
-                raise ValueError("TAR links and devices are not supported")
-        try:
-            archive.extractall(destination, members=members, filter="data")
-        except TypeError:
-            archive.extractall(destination, members=members)
-
-
-def extract_stream(source: Path, destination: Path, suffix: str) -> None:
-    name = source.name[:-len(suffix)] or source.stem or "output"
-    target = destination / name
-    opener = {".gz": gzip.open, ".bz2": bz2.open, ".xz": __import__("lzma").open}[suffix]
-    with opener(source, "rb") as src, target.open("wb") as dst:
-        shutil.copyfileobj(src, dst, length=1024 * 1024)
-
-
-def output_folder(source: Path, suffix: str, dump: Path) -> Path:
-    name = source.name[:-len(suffix)].rstrip(". ") or source.stem
+def output_folder(source: Path, extension: str, dump: Path) -> Path:
+    name = source.name[:-len(extension)].rstrip(". ") or source.stem
     target = dump / name
     number = 2
     while target.exists():
@@ -119,201 +179,279 @@ def output_folder(source: Path, suffix: str, dump: Path) -> Path:
     return target
 
 
-def signature(path: Path) -> tuple[int, int]:
-    st = path.stat()
-    return st.st_size, st.st_mtime_ns
-
-
-def stable(path: Path, seconds: float) -> bool:
+def log(message: str) -> None:
     try:
-        previous = signature(path)
+        with (base_dir() / f"{APP_NAME}.log").open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
     except OSError:
-        return False
-    unchanged_since = time.monotonic()
-    deadline = time.monotonic() + 3600
-    while time.monotonic() < deadline:
-        time.sleep(0.25)
+        pass
+
+
+@contextmanager
+def process_lock():
+    path = base_dir() / ".extract.lock"
+    handle = path.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            if handle.read(1) == b"":
+                handle.seek(0)
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
         try:
-            current = signature(path)
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         except OSError:
-            return False
-        if current != previous:
-            previous = current
-            unchanged_since = time.monotonic()
-            continue
-        if time.monotonic() - unchanged_since >= seconds:
+            pass
+        handle.close()
+
+
+def process_file(source: Path) -> Path | None:
+    try:
+        source = source.resolve()
+        if not source.is_file() or source.name.lower().endswith(TEMP_SUFFIXES):
+            return None
+        config = load_config()
+        settings = config["settings"]
+        if excluded(source, settings.get("filetypes_to_exclude", "")):
+            return None
+        picked = choose_handler(source, load_handlers(config))
+        if not picked:
+            return None
+
+        current = signature(source)
+        state_path = base_dir() / ".state.json"
+        with process_lock():
             try:
-                with path.open("rb"):
-                    return True
-            except OSError:
-                unchanged_since = time.monotonic()
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                state = {}
+            key = str(source)
+            if state.get(key) == list(current):
+                return None
+
+            handler, extension = picked
+            _, dump = configured_paths(config)
+            dump.mkdir(parents=True, exist_ok=True)
+            destination = output_folder(source, extension, dump)
+            destination.mkdir(parents=True, exist_ok=False)
+            try:
+                handler.extract(source, destination)
+            except Exception:
+                shutil.rmtree(destination, ignore_errors=True)
+                raise
+
+            state[key] = list(current)
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            if settings.getboolean("delete_after_extract", fallback=False):
+                source.unlink(missing_ok=True)
+            return destination
+    except Exception as exc:
+        log(f"{source}: {exc}")
+        return None
+
+
+def is_admin() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def service_exists() -> bool:
+    if os.name != "nt":
+        return False
+    return run_hidden(["sc.exe", "query", SERVICE_NAME]).returncode == 0
+
+
+def wait_for_service_gone(seconds: float = 10.0) -> bool:
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if run_hidden(["sc.exe", "query", SERVICE_NAME]).returncode != 0:
+            return True
+        time.sleep(0.2)
     return False
 
 
-def process_file(source: Path, seen: dict[str, tuple[int, int]] | None = None) -> Path | None:
-    source = source.resolve()
-    if not source.is_file() or source.name.lower().endswith(TEMP_SUFFIXES):
-        return None
-    config = load_config()
-    settings = config["settings"]
-    if excluded(source, settings.get("filetypes_to_exclude", "")):
-        return None
-    suffix = archive_suffix(source)
-    if not suffix:
-        return None
-    current = signature(source)
-    key = str(source).lower()
-    if seen is not None and seen.get(key) == current:
-        return None
-    _, dump = paths(config)
-    dump.mkdir(parents=True, exist_ok=True)
-    destination = output_folder(source, suffix, dump)
-    destination.mkdir(parents=True, exist_ok=False)
-    try:
-        if suffix == ".zip":
-            extract_zip(source, destination)
-        elif suffix in {".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz"}:
-            extract_tar(source, destination)
-        else:
-            extract_stream(source, destination, suffix)
-    except Exception:
-        shutil.rmtree(destination, ignore_errors=True)
-        raise
-    if seen is not None:
-        seen[key] = current
-    if settings.getboolean("open_folder", fallback=True) and os.name == "nt":
-        os.startfile(destination)
-    return destination
+def service_admin(action: str, watcher: Path | None = None, app_folder: Path | None = None) -> int:
+    if not is_admin():
+        return 5
 
+    secure_dir = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / APP_NAME
+    secure_watcher = secure_dir / "watcher.exe"
+    app_folder = app_folder or base_dir()
 
-def mutex() -> wintypes.HANDLE | None:
-    if os.name != "nt":
-        return None
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-    kernel32.CreateMutexW.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    handle = kernel32.CreateMutexW(None, False, f"Local\\{APP_NAME}")
-    if handle and kernel32.GetLastError() == 183:
-        kernel32.CloseHandle(handle)
-        return None
-    return handle
-
-
-def watch() -> int:
-    if os.name != "nt":
-        return 1
-    guard = mutex()
-    if not guard:
+    if action == "remove":
+        if service_exists():
+            run_hidden(["sc.exe", "stop", SERVICE_NAME])
+            result = run_hidden(["sc.exe", "delete", SERVICE_NAME])
+            if result.returncode and result.returncode != 1060:
+                return result.returncode
+            if not wait_for_service_gone():
+                return 1072
+        try:
+            secure_watcher.unlink(missing_ok=True)
+            secure_dir.rmdir()
+        except OSError:
+            pass
         return 0
-    config = load_config()
-    downloads, _ = paths(config)
-    downloads.mkdir(parents=True, exist_ok=True)
-    stable_seconds = max(0.5, config.getfloat("settings", "stable_seconds", fallback=2.0))
 
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.ReadDirectoryChangesW.argtypes = [
-        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, wintypes.BOOL,
-        wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p, ctypes.c_void_p,
-    ]
-    kernel32.ReadDirectoryChangesW.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    handle = kernel32.CreateFileW(
-        str(downloads),
-        0x0001,
-        0x00000001 | 0x00000002 | 0x00000004,
-        None,
-        3,
-        0x02000000,
-        None,
-    )
-    if handle == wintypes.HANDLE(-1).value:
-        kernel32.CloseHandle(guard)
+    if not watcher or not watcher.exists():
         return 2
 
-    buffer = ctypes.create_string_buffer(65536)
-    returned = wintypes.DWORD()
-    seen: dict[str, tuple[int, int]] = {}
+    if service_exists():
+        run_hidden(["sc.exe", "stop", SERVICE_NAME])
+        result = run_hidden(["sc.exe", "delete", SERVICE_NAME])
+        if result.returncode and result.returncode != 1060:
+            return result.returncode
+        if not wait_for_service_gone():
+            return 1072
 
-    try:
-        while True:
-            ok = kernel32.ReadDirectoryChangesW(
-                handle,
-                ctypes.byref(buffer),
-                len(buffer),
-                False,
-                0x00000001 | 0x00000008 | 0x00000010,
-                ctypes.byref(returned),
-                None,
-                None,
-            )
-            if not ok:
-                return 3
-            names: set[str] = set()
-            offset = 0
-            data = buffer.raw[:returned.value]
-            while offset + 12 <= len(data):
-                next_offset = int.from_bytes(data[offset:offset + 4], "little")
-                name_len = int.from_bytes(data[offset + 8:offset + 12], "little")
-                name = data[offset + 12:offset + 12 + name_len].decode("utf-16-le", errors="ignore")
-                if name:
-                    names.add(name)
-                if next_offset == 0:
-                    break
-                offset += next_offset
-            for name in names:
-                path = downloads / name
-                try:
-                    if not path.is_file() or path.name.lower().endswith(TEMP_SUFFIXES):
-                        continue
-                    if not archive_suffix(path):
-                        continue
-                    if stable(path, stable_seconds):
-                        process_file(path, seen)
-                except Exception:
-                    pass
-    finally:
-        kernel32.CloseHandle(handle)
-        kernel32.CloseHandle(guard)
+    secure_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(watcher, secure_watcher)
+    binary = f'"{secure_watcher}" --service --app-dir "{app_folder}"'
+    result = run_hidden([
+        "sc.exe", "create", SERVICE_NAME,
+        "binPath=", binary,
+        "start=", "auto",
+        "DisplayName=", APP_NAME,
+    ])
+    if result.returncode:
+        return result.returncode
+    run_hidden(["sc.exe", "description", SERVICE_NAME, "Watches Downloads and extracts supported archives."])
+    run_hidden(["sc.exe", "failure", SERVICE_NAME, "reset=", "86400", "actions=", "restart/5000/restart/15000/none/0"])
+    return run_hidden(["sc.exe", "start", SERVICE_NAME]).returncode
 
 
-def pythonw() -> Path:
-    exe = Path(sys.executable).resolve()
-    candidate = exe.with_name("pythonw.exe")
-    return candidate if candidate.exists() else exe
+def run_elevated_service(action: str, folder: Path, watcher: Path | None = None) -> bool:
+    if is_admin():
+        return service_admin(action, watcher, folder) == 0
+
+    class ShellExecuteInfo(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("fMask", wintypes.ULONG),
+            ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR),
+            ("hkeyClass", wintypes.HANDLE),
+            ("dwHotKey", wintypes.DWORD),
+            ("hIconOrMonitor", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        ]
+
+    args = [str(folder / f"{APP_NAME}.py"), "service-admin", action]
+    if watcher:
+        args.append(str(watcher))
+
+    info = ShellExecuteInfo()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = 0x00000040
+    info.lpVerb = "runas"
+    info.lpFile = str(Path(sys.executable).resolve())
+    info.lpParameters = subprocess.list2cmdline(args)
+    info.lpDirectory = str(folder)
+    info.nShow = 1
+
+    shell32 = ctypes.windll.shell32
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(ShellExecuteInfo)]
+    shell32.ShellExecuteExW.restype = wintypes.BOOL
+    if not shell32.ShellExecuteExW(ctypes.byref(info)):
+        return False
+
+    ctypes.windll.kernel32.WaitForSingleObject(info.hProcess, 0xFFFFFFFF)
+    code = wintypes.DWORD(1)
+    ctypes.windll.kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+    ctypes.windll.kernel32.CloseHandle(info.hProcess)
+    return code.value == 0
 
 
-def set_startup(enabled: bool, script: Path) -> None:
-    import winreg
-    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
-        if enabled:
-            command = subprocess.list2cmdline([str(pythonw()), str(script), "watch"])
-            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, command)
-        else:
-            try:
-                winreg.DeleteValue(key, APP_NAME)
-            except FileNotFoundError:
-                pass
-
-
-def launch_watcher(script: Path) -> None:
-    flags = 0
-    if os.name == "nt":
-        flags = 0x00000008 | 0x00000200 | 0x08000000
-    subprocess.Popen(
-        [str(pythonw()), str(script), "watch"],
-        cwd=str(script.parent),
-        creationflags=flags,
-        close_fds=True,
+def compiler_candidates() -> list[Path]:
+    names = (
+        "x86_64-w64-mingw32-g++.exe",
+        "x86_64-w64-mingw32-c++.exe",
+        "g++.exe",
+        "clang++.exe",
     )
+    found: list[Path] = []
+    for name in names:
+        value = shutil.which(name)
+        if value:
+            found.append(Path(value))
+
+    roots = (
+        Path(r"C:\Mingw\Mingw64\bin"),
+        Path(r"C:\Mingw\mingw64\bin"),
+        Path(r"C:\MinGW\Mingw64\bin"),
+        Path(r"C:\MinGW\mingw64\bin"),
+        Path(r"C:\mingw64\bin"),
+        Path(r"C:\msys64\mingw64\bin"),
+        Path(r"C:\Mingw\64\bin"),
+    )
+    for root in roots:
+        for name in names:
+            path = root / name
+            if path.exists():
+                found.append(path)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in found:
+        key = str(path).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def build_watcher(folder: Path) -> Path | None:
+    output = folder / "watcher.exe"
+    source = folder / "watcher.cpp"
+
+    for compiler in compiler_candidates():
+        command = [
+            str(compiler), "-std=c++17", "-O2", "-s", "-municode", "-mwindows", "-static",
+            str(source), "-o", str(output),
+            "-lshell32", "-lwtsapi32", "-luserenv", "-ladvapi32",
+        ]
+        if run_hidden(command, folder).returncode == 0 and output.exists():
+            return output
+
+    compiler = shutil.which("cl.exe")
+    if compiler:
+        command = [
+            compiler, "/nologo", "/std:c++17", "/O2", "/EHsc", "/MT", str(source), f"/Fe{output}",
+            "/link", "/SUBSYSTEM:WINDOWS", "Shell32.lib", "Wtsapi32.lib", "Userenv.lib", "Advapi32.lib",
+        ]
+        if run_hidden(command, folder).returncode == 0 and output.exists():
+            return output
+    return None
 
 
 def install() -> int:
@@ -321,21 +459,37 @@ def install() -> int:
         print("Windows only.")
         return 1
 
-    add_startup = input("Add to startup? (Y / N) ").strip().lower() in {"y", "yes"}
-    downloads_text = input("Downloads folder? Leave blank = default ").strip()
-    downloads = expand_path(downloads_text) if downloads_text else (Path.home() / "Downloads").resolve()
+    startup_service = input("Add startup service? (Y / N) ").strip().lower() in {"y", "yes"}
+    downloads_text = input("Downloads folder? Leave black = default ").strip()
+    downloads = Path(os.path.expandvars(os.path.expanduser(downloads_text.strip('"')))).resolve() if downloads_text else downloads_default().resolve()
     dump_text = input("Dump folder? Leave blank = default ").strip()
-    dump = expand_path(dump_text) if dump_text else (downloads / "Dump").resolve()
+    dump = Path(os.path.expandvars(os.path.expanduser(dump_text.strip('"')))).resolve() if dump_text else (downloads / "Dump").resolve()
     install_text = input("Install folder? Leave blank = default ").strip()
     default_install = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
-    folder = expand_path(install_text) if install_text else default_install.resolve()
+    folder = Path(os.path.expandvars(os.path.expanduser(install_text.strip('"')))).resolve() if install_text else default_install.resolve()
     excludes = input("Filetypes to exclude? Put a comma between ").strip()
 
+    source = base_dir()
+    if service_exists() and not run_elevated_service("remove", source):
+        print("Could not replace the existing startup service.")
+        return 1
     folder.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / f"{APP_NAME}.py", folder / f"{APP_NAME}.py")
+    shutil.copy2(source / "watcher.cpp", folder / "watcher.cpp")
+    shutil.copytree(source / "filetypes-functionality", folder / "filetypes-functionality", dirs_exist_ok=True)
+
+    bundled = source / "watcher.exe"
+    if bundled.exists():
+        shutil.copy2(bundled, folder / "watcher.exe")
+    watcher = folder / "watcher.exe"
+    if not watcher.exists():
+        watcher = build_watcher(folder)
+    if not watcher:
+        print("Could not build watcher.exe. Install MinGW-w64 or Visual Studio C++ tools and run install.bat again.")
+        return 1
+
     downloads.mkdir(parents=True, exist_ok=True)
     dump.mkdir(parents=True, exist_ok=True)
-    script = folder / "Auto_Unzip-Save-Open.py"
-    shutil.copy2(Path(__file__).resolve(), script)
 
     config = configparser.ConfigParser(interpolation=None)
     config["settings"] = {
@@ -344,14 +498,23 @@ def install() -> int:
         "install_folder": str(folder),
         "filetypes_to_exclude": excludes,
         "open_folder": "yes",
+        "delete_after_extract": "no",
+        "startup_service": "yes" if startup_service else "no",
         "stable_seconds": "2.0",
-        "startup": "yes" if add_startup else "no",
     }
+    config["handlers"] = {"zip": "yes", "formats": "yes"}
+    config["runtime"] = {"python": str(Path(sys.executable).resolve())}
     with (folder / "config.ini").open("w", encoding="utf-8") as handle:
         config.write(handle)
 
-    set_startup(add_startup, script)
-    launch_watcher(script)
+    if startup_service:
+        if not run_elevated_service("install", folder, watcher):
+            config["settings"]["startup_service"] = "no"
+            with (folder / "config.ini").open("w", encoding="utf-8") as handle:
+                config.write(handle)
+            print("Could not install the startup service.")
+            return 1
+
     print(f"Installed: {folder}")
     return 0
 
@@ -359,27 +522,38 @@ def install() -> int:
 def uninstall() -> int:
     if os.name != "nt":
         return 1
-    set_startup(False, base_dir() / "Auto_Unzip-Save-Open.py")
-    print(f"Startup entry removed. Delete this folder when the watcher is stopped: {base_dir()}")
+    folder = base_dir()
+    if service_exists():
+        if not run_elevated_service("remove", folder):
+            print("Could not remove the startup service.")
+            return 1
+    print(f"Remove this folder: {folder}")
     return 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="Auto_Unzip-Save-Open")
-    parser.add_argument("command", nargs="?", choices=("install", "watch", "process", "uninstall"), default="install")
+    parser = argparse.ArgumentParser(prog=APP_NAME)
+    parser.add_argument("command", nargs="?", choices=("install", "process", "uninstall", "service-admin"), default="install")
     parser.add_argument("path", nargs="?")
+    parser.add_argument("result", nargs="?")
     args = parser.parse_args()
+
     if args.command == "install":
         return install()
-    if args.command == "watch":
-        return watch()
     if args.command == "uninstall":
         return uninstall()
+    if args.command == "service-admin":
+        watcher = Path(args.result) if args.result else None
+        return service_admin(args.path or "", watcher)
     if not args.path:
         return 2
-    result = process_file(Path(args.path))
-    if result:
-        print(result)
+
+    destination = process_file(Path(args.path))
+    if destination:
+        if args.result:
+            Path(args.result).write_text(str(destination), encoding="utf-8")
+        else:
+            print(destination)
     return 0
 
 
