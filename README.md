@@ -1,9 +1,5 @@
 # AUSO - Auto unzip, save, and open
-Downloaded a zip file? Great. Let's rawdog that badboy and tear it wide open, filing it away and opening it up automatically. This project adds a config to make it customizable, supports multiple archive formats, and saves you seconds on routine downloads.
-
-For releases, check the GitHub releases page. This still needs compiling. Alternatively, use the portable version.
-
-NOTE: THIS IS NOT THE RELEASE; THIS IS THE SOURCE FILES.
+Downloaded a zip file? Great. Let's rawdog that badboy and tear it wide open, filing it away and opening it up automatically. This project adds a config to make it customisable, supports multiple archive formats, and saves you seconds on routine downloads.
 
 ## What does it do?
 AUSO watches folders and automatically extracts new archives.
