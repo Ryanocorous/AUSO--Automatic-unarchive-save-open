@@ -18,36 +18,6 @@ Employs a watcher to check when archive files are downloaded. It then automatica
 
 Still to do: Add comments to the code, add alerts, filtering options, a TypeScript GUI, folder hotkeys, extra watched folders, about, history, pause, malicious zip rejection (coming very soon), Linux tests, and Contract.json shared commands.
 
-Use: Just download the release and run install.bat
+## Use
 
-## Build
-
-One-command build:
-
-```text
-Build-Complete.bat
-```
-
-MinGW-w64:
-
-```text
-Build-Watcher-MinGW.bat
-```
-
-MSVC Developer Command Prompt:
-
-```text
-Build-Watcher-MSVC.bat
-```
-
-Both build `watcher.exe` from:
-
-```text
-src\watcher.cpp
-src\runtime.cpp
-src\runtime.hpp
-```
-
-Then run `install.bat`.
-
-The project also includes the Python extractor, tray UI, all loading icons 1–14, Python/EXE handler examples, EXE progress hooks, service/startup support, move/recycle handling and uninstall.
+Run install.bat and go through the installation 
